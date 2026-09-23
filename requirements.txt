@@ -1,0 +1,12 @@
+﻿torch
+torchaudio
+transformers
+vosk
+pyaudio
+soundfile
+numpy
+scipy
+fastapi
+uvicorn
+websockets
+huggingface_hub
