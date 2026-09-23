@@ -1,8 +1,3 @@
-"""
-SIH Problem Statement 104: Real-Time Voice Cloning and Coercion Detection Pipeline
-Unified Live Prototype with FastAPI + WebSocket High-Performance Web Dashboard
-"""
-
 import os
 import sys
 import json
@@ -18,15 +13,14 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-# ---------------------------------------------------------
-# 1. System Constants & Risk Formula
-# ---------------------------------------------------------
+# Audio stream and buffer settings
 RATE = 16000
-CHUNK_DUR = 0.5                      # 0.5s audio slices
-BUFFER_DUR = 3.0                     # 3.0s sliding ring buffer
-CHUNK_FRAMES = int(RATE * CHUNK_DUR)   # 8,000 samples
-BUFFER_FRAMES = int(RATE * BUFFER_DUR) # 48,000 samples
+CHUNK_DUR = 0.5
+BUFFER_DUR = 3.0
+CHUNK_FRAMES = int(RATE * CHUNK_DUR)
+BUFFER_FRAMES = int(RATE * BUFFER_DUR)
 
+# Scoring weights and thresholds
 WEIGHT_SYNTHETIC = 0.60
 WEIGHT_COERCION = 0.40
 CRITICAL_THRESHOLD = 0.70
@@ -34,32 +28,33 @@ WARNING_THRESHOLD = 0.40
 
 MODEL_ID = "garystafford/wav2vec2-deepfake-voice-detector"
 
+# Keywords used to flag potential scams
 SCAM_LEXICON = {
-    "arrest": 0.40,
+    "arrest": 0.35,
     "police": 0.35,
     "customs": 0.35,
-    "cbi": 0.45,
-    "ed": 0.40,
+    "cbi": 0.40,
+    "ed": 0.35,
     "court": 0.30,
     "jail": 0.35,
-    "warrant": 0.40,
+    "warrant": 0.35,
     "upi": 0.35,
     "pin": 0.35,
     "otp": 0.40,
     "transfer": 0.30,
     "immediate": 0.25,
     "urgent": 0.25,
-    "emergency": 0.30,
+    "emergency": 0.25,
     "frozen": 0.35,
     "account": 0.20,
-    "kyc": 0.35
+    "kyc": 0.30
 }
 
-# ---------------------------------------------------------
-# 2. Pipeline State & Queues
-# ---------------------------------------------------------
+# Queues and shared state
 audio_queue = queue.Queue(maxsize=20)
 active_websockets = []
+reset_requested = False
+
 latest_telemetry = {
     "p_synthetic": 0.0,
     "p_coercion": 0.0,
@@ -72,16 +67,14 @@ latest_telemetry = {
     "waveform": []
 }
 
+# Load the acoustic model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"[*] Initializing ML Pipeline on {device}...")
-
-# Load Acoustic Deepfake Detector
 feature_extractor = AutoFeatureExtractor.from_pretrained(MODEL_ID)
 acoustic_model = AutoModelForAudioClassification.from_pretrained(MODEL_ID).to(device)
 acoustic_model.eval()
-print("[*] Acoustic Classifier Loaded.")
 
-# Load Vosk STT Engine (Graceful fallback if weights folder missing)
+# Load Vosk for speech recognition
+vosk_model = None
 vosk_recognizer = None
 try:
     from vosk import Model, KaldiRecognizer
@@ -94,15 +87,10 @@ try:
     if os.path.exists(model_dir):
         vosk_model = Model(model_dir)
         vosk_recognizer = KaldiRecognizer(vosk_model, RATE)
-        print(f"[*] Vosk STT Engine initialized from '{model_dir}'.")
-    else:
-        print("[!] Warning: Vosk 'model/' directory not found. Coercion engine running in fallback mode.")
 except Exception as e:
-    print(f"[!] Vosk initialization notice: {e}")
+    print(f"Vosk load error: {e}")
 
-# ---------------------------------------------------------
-# 3. Audio Ingestion Worker (Producer Thread)
-# ---------------------------------------------------------
+# Read microphone input in the background
 def audio_capture_worker():
     p = pyaudio.PyAudio()
     try:
@@ -114,10 +102,9 @@ def audio_capture_worker():
             frames_per_buffer=CHUNK_FRAMES
         )
     except Exception as e:
-        print(f"[!] Audio stream open error: {e}")
+        print(f"Mic error: {e}")
         return
 
-    print("[*] PyAudio background capture thread running.")
     while True:
         try:
             raw_bytes = stream.read(CHUNK_FRAMES, exception_on_overflow=False)
@@ -127,32 +114,54 @@ def audio_capture_worker():
         except Exception:
             continue
 
-# ---------------------------------------------------------
-# 4. Dual-Engine Processing Loop (Consumer Thread)
-# ---------------------------------------------------------
+# Process audio chunks and run analysis
 def ml_inference_worker():
-    global latest_telemetry
+    global latest_telemetry, reset_requested, vosk_recognizer
     ring_buffer = np.zeros(BUFFER_FRAMES, dtype=np.float32)
     rolling_transcript = ""
 
-    print("[*] Real-Time Inference Worker active.")
-
     while True:
         chunk = audio_queue.get()
+
+        # Handle full system reset request
+        if reset_requested:
+            ring_buffer = np.zeros(BUFFER_FRAMES, dtype=np.float32)
+            rolling_transcript = ""
+            while not audio_queue.empty():
+                try:
+                    audio_queue.get_nowait()
+                except queue.Empty:
+                    break
+            if vosk_model is not None:
+                from vosk import KaldiRecognizer
+                vosk_recognizer = KaldiRecognizer(vosk_model, RATE)
+            
+            latest_telemetry = {
+                "p_synthetic": 0.0,
+                "p_coercion": 0.0,
+                "total_risk": 0.0,
+                "status": "SAFE",
+                "transcript": "[System Reset: Listening for speech...]",
+                "flags": [],
+                "circuit_breaker": False,
+                "latency_ms": 0,
+                "waveform": []
+            }
+            reset_requested = False
+            continue
+
         t_start = time.time()
 
-        # Update 3.0s Ring Buffer
+        # Update sliding 3-second buffer
         ring_buffer[:-CHUNK_FRAMES] = ring_buffer[CHUNK_FRAMES:]
         ring_buffer[-CHUNK_FRAMES:] = chunk
 
-        # -----------------------------------------------------
-        # Branch A: Acoustic Synthetic Inference
-        # -----------------------------------------------------
+        # Check for synthetic voice artifacts
         p_synthetic = 0.0
         rms = np.sqrt(np.mean(ring_buffer**2))
-        if rms > 0.005:  # Noise gate threshold
+        
+        if rms > 0.012:
             norm_audio = (ring_buffer - np.mean(ring_buffer)) / (np.std(ring_buffer) + 1e-7)
-            
             inputs = feature_extractor(
                 norm_audio,
                 sampling_rate=RATE,
@@ -164,40 +173,47 @@ def ml_inference_worker():
             with torch.no_grad():
                 logits = acoustic_model(input_values).logits
                 probs = torch.softmax(logits, dim=-1).squeeze().tolist()
-                p_synthetic = float(probs[1])
+                raw_synthetic_prob = float(probs[1])
+                
+                if raw_synthetic_prob < 0.35:
+                    p_synthetic = raw_synthetic_prob * 0.5
+                else:
+                    p_synthetic = raw_synthetic_prob
 
-        # -----------------------------------------------------
-        # Branch B: Semantic Coercion Engine (Vosk)
-        # -----------------------------------------------------
+        # Run offline speech-to-text
         p_coercion = 0.0
         matched_flags = []
-        transcript_update = ""
+        current_display = rolling_transcript
 
         if vosk_recognizer is not None:
             chunk_int16 = (chunk * 32767).astype(np.int16).tobytes()
+            
             if vosk_recognizer.AcceptWaveform(chunk_int16):
                 res = json.loads(vosk_recognizer.Result())
-                transcript_update = res.get("text", "").lower()
+                final_text = res.get("text", "").strip()
+                if final_text:
+                    rolling_transcript = (rolling_transcript + " " + final_text).strip()
+                    words = rolling_transcript.split()
+                    if len(words) > 30:
+                        rolling_transcript = " ".join(words[-30:])
+                current_display = rolling_transcript
             else:
                 partial = json.loads(vosk_recognizer.PartialResult())
-                transcript_update = partial.get("partial", "").lower()
+                partial_text = partial.get("partial", "").strip()
+                if partial_text:
+                    current_display = (rolling_transcript + " " + partial_text).strip()
 
-            if transcript_update:
-                rolling_transcript = (rolling_transcript + " " + transcript_update).strip()
-                if len(rolling_transcript.split()) > 40:
-                    rolling_transcript = " ".join(rolling_transcript.split()[-40:])
+        # Count keyword occurrences
+        search_words = current_display.lower().split()
+        for word, weight in SCAM_LEXICON.items():
+            count = search_words.count(word)
+            if count > 0:
+                p_coercion += weight * count
+                matched_flags.append(f"{word.upper()} (x{count})" if count > 1 else word.upper())
 
-        # Lexicon scoring over transcript
-        search_space = (rolling_transcript + " " + transcript_update).lower()
-        for word, score in SCAM_LEXICON.items():
-            if word in search_space:
-                p_coercion += score
-                matched_flags.append(word.upper())
         p_coercion = min(p_coercion, 1.0)
 
-        # -----------------------------------------------------
-        # Risk Aggregation & Circuit Breaker Logic
-        # -----------------------------------------------------
+        # Calculate combined threat score
         total_risk = (WEIGHT_SYNTHETIC * p_synthetic) + (WEIGHT_COERCION * p_coercion)
         circuit_breaker = total_risk >= CRITICAL_THRESHOLD
 
@@ -210,7 +226,7 @@ def ml_inference_worker():
 
         latency_ms = int((time.time() - t_start) * 1000)
 
-        # Downsample waveform for lightweight visualization (64 points)
+        # Downsample waveform for UI rendering
         downsample_step = len(chunk) // 64
         waveform_sample = chunk[::downsample_step].tolist()
 
@@ -219,17 +235,15 @@ def ml_inference_worker():
             "p_coercion": round(p_coercion * 100, 1),
             "total_risk": round(total_risk * 100, 1),
             "status": status,
-            "transcript": rolling_transcript if rolling_transcript else "[Listening for speech...]",
+            "transcript": current_display if current_display else "[Listening for speech...]",
             "flags": list(set(matched_flags)),
             "circuit_breaker": circuit_breaker,
             "latency_ms": latency_ms,
             "waveform": waveform_sample
         }
 
-# ---------------------------------------------------------
-# 5. FastAPI & Glassmorphism Dashboard UI
-# ---------------------------------------------------------
-app = FastAPI(title="SIH-104 Real-Time Defense System")
+# Web application and dashboard
+app = FastAPI()
 
 HTML_DASHBOARD = """
 <!DOCTYPE html>
@@ -237,7 +251,7 @@ HTML_DASHBOARD = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SIH-104: Dual-Engine Voice Cloning & Coercion Defense</title>
+    <title>Voice Interceptor Dashboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
     <style>
         :root {
@@ -247,7 +261,6 @@ HTML_DASHBOARD = """
             --safe: #10b981;
             --warning: #f59e0b;
             --critical: #ef4444;
-            --accent: #3b82f6;
             --text-main: #f8fafc;
             --text-muted: #94a3b8;
         }
@@ -268,8 +281,8 @@ HTML_DASHBOARD = """
             border-bottom: 1px solid var(--border);
             margin-bottom: 24px;
         }
-        .title h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.5px; }
-        .title p { font-size: 0.85rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+        .title h1 { font-size: 1.45rem; font-weight: 700; letter-spacing: -0.5px; }
+        .title p { font-size: 0.82rem; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
         .badge {
             padding: 6px 14px;
             border-radius: 999px;
@@ -296,7 +309,7 @@ HTML_DASHBOARD = """
             padding: 20px;
         }
         .card h2 {
-            font-size: 0.95rem;
+            font-size: 0.88rem;
             text-transform: uppercase;
             letter-spacing: 1px;
             color: var(--text-muted);
@@ -336,7 +349,7 @@ HTML_DASHBOARD = """
             border-radius: 10px;
             padding: 14px;
         }
-        .sub-card span { font-size: 0.75rem; color: var(--text-muted); }
+        .sub-card span { font-size: 0.72rem; color: var(--text-muted); font-weight: 600; }
         .sub-card h3 { font-size: 1.6rem; font-family: 'JetBrains Mono', monospace; margin-top: 4px; }
         
         .transcript-box {
@@ -346,7 +359,7 @@ HTML_DASHBOARD = """
             border-radius: 8px;
             padding: 12px;
             font-family: 'JetBrains Mono', monospace;
-            font-size: 0.85rem;
+            font-size: 0.82rem;
             line-height: 1.5;
             color: #cbd5e1;
             margin-bottom: 16px;
@@ -362,48 +375,74 @@ HTML_DASHBOARD = """
             color: #fca5a5;
             padding: 4px 10px;
             border-radius: 6px;
-            font-size: 0.75rem;
+            font-size: 0.72rem;
             font-weight: 700;
             font-family: 'JetBrains Mono', monospace;
         }
         canvas {
             width: 100%;
             height: 60px;
-            background: rgba(0,0,0,0.2);
+            background: rgba(0,0,0,0.25);
             border-radius: 8px;
             margin-top: 10px;
         }
-        /* Circuit Breaker Overlay */
+
         #breaker-overlay {
             display: none;
             position: fixed;
             inset: 0;
-            background: rgba(15, 23, 42, 0.85);
-            backdrop-filter: blur(8px);
-            z-index: 100;
+            background: rgba(10, 14, 26, 0.95);
+            backdrop-filter: blur(12px);
+            z-index: 999999;
             justify-content: center;
             align-items: center;
+            user-select: none;
         }
         .breaker-card {
-            background: #1e1b2e;
+            background: #191428;
             border: 2px solid var(--critical);
             border-radius: 16px;
-            padding: 36px;
+            padding: 40px;
             text-align: center;
-            max-width: 480px;
-            box-shadow: 0 0 50px rgba(239, 68, 68, 0.4);
+            max-width: 520px;
+            box-shadow: 0 0 60px rgba(239, 68, 68, 0.5);
+            animation: shake 0.5s ease;
         }
-        .breaker-card h2 { color: var(--critical); font-size: 1.8rem; margin-bottom: 12px; }
-        .breaker-card p { font-size: 0.95rem; color: #cbd5e1; margin-bottom: 24px; line-height: 1.5; }
+        @keyframes shake {
+            0%, 100% { transform: translate(0, 0); }
+            20%, 60% { transform: translate(-8px, 0); }
+            40%, 80% { transform: translate(8px, 0); }
+        }
+        .breaker-card h2 { color: var(--critical); font-size: 1.8rem; margin-bottom: 10px; }
+        .breaker-card p { font-size: 0.92rem; color: #cbd5e1; margin-bottom: 20px; line-height: 1.5; }
+        .lockdown-status {
+            font-family: 'JetBrains Mono', monospace;
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.4);
+            color: #fca5a5;
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-size: 0.8rem;
+            margin-bottom: 24px;
+            display: inline-block;
+        }
         .breaker-btn {
-            background: var(--critical);
-            color: white;
-            border: none;
+            background: rgba(255, 255, 255, 0.08);
+            color: #64748b;
+            border: 1px solid rgba(255, 255, 255, 0.1);
             padding: 12px 24px;
             font-weight: 700;
             border-radius: 8px;
-            cursor: pointer;
+            cursor: not-allowed;
             font-family: 'Space Grotesk', sans-serif;
+            transition: all 0.3s ease;
+        }
+        .breaker-btn.active {
+            background: var(--critical);
+            color: white;
+            cursor: pointer;
+            border: none;
+            box-shadow: 0 4px 14px rgba(239, 68, 68, 0.4);
         }
     </style>
 </head>
@@ -411,19 +450,18 @@ HTML_DASHBOARD = """
 
     <div class="header">
         <div class="title">
-            <h1>SIH-104: Dual-Engine Voice Cloning & Coercion Interceptor</h1>
-            <p>Acoustic Model: Wav2Vec2 (Gary Stafford) | Semantic Engine: Vosk Kaldi</p>
+            <h1>Voice Interceptor Dashboard</h1>
+            <p>Real-time speech analysis & automated protection</p>
         </div>
         <div id="system-badge" class="badge badge-safe">SYSTEM SECURE</div>
     </div>
 
     <div class="grid">
-        <!-- Risk Aggregator Column -->
         <div class="card">
-            <h2>Composite Real-Time Threat Score</h2>
+            <h2>Current Risk Level</h2>
             <div class="metric-hero">
                 <div id="total-risk" class="metric-value">0.0%</div>
-                <div style="color: var(--text-muted); font-size: 0.85rem;">Formula: 0.60×Acoustic + 0.40×Coercion</div>
+                <div style="color: var(--text-muted); font-size: 0.82rem;">Weighted: 60% Acoustic + 40% Keyword</div>
             </div>
             <div class="gauge-bar">
                 <div id="gauge-fill" class="gauge-fill"></div>
@@ -431,42 +469,44 @@ HTML_DASHBOARD = """
 
             <div class="sub-metrics">
                 <div class="sub-card">
-                    <span>ACOUSTIC SYNTHETIC PROBABILITY</span>
+                    <span>SYNTHETIC VOICE SCORE</span>
                     <h3 id="p-synthetic">0.0%</h3>
                 </div>
                 <div class="sub-card">
-                    <span>COERCION / EXTORTION PROBABILITY</span>
+                    <span>COERCION INTENT SCORE</span>
                     <h3 id="p-coercion">0.0%</h3>
                 </div>
             </div>
 
             <div style="margin-top: 20px;">
-                <h2>Audio Ingestion Oscilloscope</h2>
+                <h2>Microphone Input</h2>
                 <canvas id="waveform-canvas"></canvas>
             </div>
         </div>
 
-        <!-- Coercion & Telemetry Column -->
         <div class="card">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                <h2>Live Telephony Transcript Stream</h2>
-                <span id="latency" style="font-size: 0.75rem; color: var(--text-muted); font-family: 'JetBrains Mono';">0 ms</span>
+                <h2>Live Transcript</h2>
+                <span id="latency" style="font-size: 0.72rem; color: var(--text-muted); font-family: 'JetBrains Mono';">0 ms loop</span>
             </div>
             <div id="transcript-box" class="transcript-box">[Listening for speech...]</div>
 
-            <h2>Triggered Scam Markers</h2>
+            <h2>Detected Keywords</h2>
             <div id="flags-container" class="flags-container">
-                <span style="color: var(--text-muted); font-size: 0.8rem;">No coercive keywords detected.</span>
+                <span style="color: var(--text-muted); font-size: 0.8rem;">No threat keywords detected.</span>
             </div>
         </div>
     </div>
 
-    <!-- Circuit Breaker Modal -->
     <div id="breaker-overlay">
         <div class="breaker-card">
-            <h2>CIRCUIT BREAKER TRIPPED</h2>
-            <p>High-confidence synthetic voice cloning and coercive extortion pattern detected. Financial transactions and biometric authentication have been temporarily suspended.</p>
-            <button class="breaker-btn" onclick="dismissBreaker()">Override / Step-Up Auth</button>
+            <h2>SUSPICIOUS CALL DETECTED</h2>
+            <p>Synthetic voice patterns and high-pressure phrases were detected. Sensitive actions are temporarily locked.</p>
+            <div class="lockdown-status" id="lockdown-status">DEVICE LOCKED: 5s COOLDOWN ACTIVE</div>
+            <br>
+            <button id="breaker-btn" class="breaker-btn" disabled onclick="dismissBreaker()">
+                Lockdown Active (5s)
+            </button>
         </div>
     </div>
 
@@ -481,10 +521,13 @@ HTML_DASHBOARD = """
         const flagsContainer = document.getElementById('flags-container');
         const latencyEl = document.getElementById('latency');
         const breakerOverlay = document.getElementById('breaker-overlay');
+        const breakerBtn = document.getElementById('breaker-btn');
+        const lockdownStatus = document.getElementById('lockdown-status');
         const canvas = document.getElementById('waveform-canvas');
         const ctx = canvas.getContext('2d');
 
-        let breakerDismissed = false;
+        let isLockdownActive = false;
+        let countdownTimer = null;
 
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
@@ -495,37 +538,83 @@ HTML_DASHBOARD = """
             latencyEl.textContent = `${data.latency_ms} ms loop`;
             transcriptBox.textContent = data.transcript;
 
-            // Gauge fill & color transitions
             gaugeFill.style.width = `${data.total_risk}%`;
             if (data.status === 'CRITICAL') {
                 gaugeFill.style.backgroundColor = 'var(--critical)';
                 systemBadge.className = 'badge badge-critical';
                 systemBadge.textContent = 'CRITICAL THREAT';
-                if (!breakerDismissed) breakerOverlay.style.display = 'flex';
+                
+                if (!isLockdownActive) {
+                    triggerLockdown();
+                }
             } else if (data.status === 'WARNING') {
                 gaugeFill.style.backgroundColor = 'var(--warning)';
                 systemBadge.className = 'badge badge-warning';
                 systemBadge.textContent = 'CAUTION ADVISED';
-                breakerOverlay.style.display = 'none';
-                breakerDismissed = false;
             } else {
                 gaugeFill.style.backgroundColor = 'var(--safe)';
                 systemBadge.className = 'badge badge-safe';
                 systemBadge.textContent = 'SYSTEM SECURE';
-                breakerOverlay.style.display = 'none';
-                breakerDismissed = false;
             }
 
-            // Scam keywords
             if (data.flags.length > 0) {
                 flagsContainer.innerHTML = data.flags.map(f => `<span class="flag-tag">${f}</span>`).join('');
             } else {
-                flagsContainer.innerHTML = '<span style="color: var(--text-muted); font-size: 0.8rem;">No coercive keywords detected.</span>';
+                flagsContainer.innerHTML = '<span style="color: var(--text-muted); font-size: 0.8rem;">No threat keywords detected.</span>';
             }
 
-            // Draw oscilloscope
             drawWaveform(data.waveform);
         };
+
+        function triggerLockdown() {
+            isLockdownActive = true;
+            breakerOverlay.style.display = 'flex';
+            breakerBtn.disabled = true;
+            breakerBtn.className = 'breaker-btn';
+            
+            let timeLeft = 5;
+            breakerBtn.textContent = `Lockdown Active (${timeLeft}s)`;
+            lockdownStatus.textContent = `DEVICE LOCKED (${timeLeft}s)`;
+
+            clearInterval(countdownTimer);
+            countdownTimer = setInterval(() => {
+                timeLeft -= 1;
+                if (timeLeft > 0) {
+                    breakerBtn.textContent = `Lockdown Active (${timeLeft}s)`;
+                    lockdownStatus.textContent = `DEVICE LOCKED (${timeLeft}s)`;
+                } else {
+                    clearInterval(countdownTimer);
+                    breakerBtn.disabled = false;
+                    breakerBtn.className = 'breaker-btn active';
+                    breakerBtn.textContent = 'Acknowledge & Dismiss';
+                    lockdownStatus.textContent = 'COOLDOWN EXPIRED - STEP-UP AUTH REQUIRED';
+                }
+            }, 1000);
+        }
+
+        async function dismissBreaker() {
+            if (breakerBtn.disabled) return;
+            
+            // Send reset command to backend
+            await fetch('/reset', { method: 'POST' });
+
+            // Instantly clear UI elements
+            breakerOverlay.style.display = 'none';
+            totalRiskEl.textContent = '0.0%';
+            pSynthEl.textContent = '0.0%';
+            pCoerceEl.textContent = '0.0%';
+            gaugeFill.style.width = '0%';
+            gaugeFill.style.backgroundColor = 'var(--safe)';
+            systemBadge.className = 'badge badge-safe';
+            systemBadge.textContent = 'SYSTEM SECURE';
+            transcriptBox.textContent = '[System Reset: Listening for speech...]';
+            flagsContainer.innerHTML = '<span style="color: var(--text-muted); font-size: 0.8rem;">No threat keywords detected.</span>';
+
+            // 5 second cooldown before breaker can trip again
+            setTimeout(() => {
+                isLockdownActive = false;
+            }, 5000);
+        }
 
         function drawWaveform(points) {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -543,11 +632,6 @@ HTML_DASHBOARD = """
             }
             ctx.stroke();
         }
-
-        function dismissBreaker() {
-            breakerDismissed = true;
-            breakerOverlay.style.display = 'none';
-        }
     </script>
 </body>
 </html>
@@ -556,6 +640,13 @@ HTML_DASHBOARD = """
 @app.get("/")
 def get_dashboard():
     return HTMLResponse(content=HTML_DASHBOARD)
+
+# API endpoint to clear history and reset buffers
+@app.post("/reset")
+def reset_system():
+    global reset_requested
+    reset_requested = True
+    return {"status": "ok"}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -568,9 +659,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         active_websockets.remove(websocket)
 
-# ---------------------------------------------------------
-# 6. Bootstrap Daemon
-# ---------------------------------------------------------
+# Start background workers and launch server
 if __name__ == "__main__":
     t_capture = threading.Thread(target=audio_capture_worker, daemon=True)
     t_capture.start()
@@ -578,8 +667,5 @@ if __name__ == "__main__":
     t_inference = threading.Thread(target=ml_inference_worker, daemon=True)
     t_inference.start()
 
-    print("\n=======================================================")
-    print(" SIH-104 DEFENSE PROTOCOL ACTIVE")
-    print(" Dashboard: http://localhost:8000")
-    print("=======================================================\n")
+    print("Server running at http://localhost:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
